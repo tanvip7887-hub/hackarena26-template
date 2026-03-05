@@ -1,8 +1,10 @@
 """
-anomaly_detector.py — FINAL
-Combines user's good features (FPS norm, threat decay)
-with all v5 fixes (jitter filter, circular std, baseline crouching,
-anchor circling, dynamic tailgate, frame fill guard).
+anomaly_detector.py — FINAL + LLM support
+Added:
+  - MIN_DISPLACEMENT_FRAC (fraction-based, camera independent)
+  - get_current_speed_pxsec()  — for ML features in threat_engine
+  - get_freeze_duration()      — for ML features in threat_engine
+  - get_anomalies_with_scores() — explicit method for LLM factor list
 """
 import math
 import time
@@ -28,59 +30,49 @@ class PersonBehaviourTracker:
 
     HISTORY_FRAMES   = 90
 
-    # ── Jitter filter (most important fix) ────────────────────
-    # YOLO bbox jitter is typically 2-6px per frame.
-    # Any movement below this = treat as stationary.
-    # This prevents pacing/erratic/circling false positives.
-    MIN_DISPLACEMENT = 8     # px
+    # FIX: Fraction-based displacement — scales with any camera resolution
+    # OLD: MIN_DISPLACEMENT = 8  (broke on 1080p cameras)
+    # NEW: 1.2% of frame width
+    #   640px  → 7.7px  (similar to old value)
+    #   1280px → 15.4px (auto-scales up for higher res)
+    MIN_DISPLACEMENT_FRAC = 0.012
 
-    # ── Speed (normalized — camera independent) ───────────────
-    # Speed stored as fraction of frame diagonal per second.
-    # Works correctly regardless of camera resolution or angle.
-    # frame diagonal 640x480 = 800px
-    # Normal walk  ≈ 0.10-0.15 diag/sec
-    # Running      ≈ 0.22 diag/sec
-    # Sprinting    ≈ 0.40 diag/sec
+    # Speed (normalized — camera independent)
     RUNNING_DIAG_FRAC   = 0.22
     SPRINTING_DIAG_FRAC = 0.40
     SPEED_STILL         = 15     # px/sec for freeze check only
 
-    # ── Pacing ────────────────────────────────────────────────
-    PACE_WINDOW       = 40       # frames to look back
-    PACE_REVERSALS    = 8        # min reversals needed (was 4, doubled for jitter)
-    PACE_ANGLE_THRESH = 150      # degrees — counts as direction reversal
+    # Pacing
+    PACE_WINDOW       = 40
+    PACE_REVERSALS    = 8
+    PACE_ANGLE_THRESH = 150
 
-    # ── Erratic (circular std) ────────────────────────────────
-    ERRATIC_CIRC_STD  = 1.2     # radians — ~69° spread = erratic
+    # Erratic (circular std)
+    ERRATIC_CIRC_STD  = 1.2
     ERRATIC_WINDOW    = 20
 
-    # ── Circling ──────────────────────────────────────────────
-    CIRCLE_MIN_PATH       = 200  # px — must travel this far total
-    CIRCLE_ANCHOR_RETURN  = 40   # px — must return within 40px of FIRST position
-    CIRCLE_ROLLING_RETURN = 25   # px — rolling window return threshold
+    # Circling
+    CIRCLE_MIN_PATH       = 200
+    CIRCLE_ANCHOR_RETURN  = 40
+    CIRCLE_ROLLING_RETURN = 25
 
-    # ── Freeze ────────────────────────────────────────────────
-    FREEZE_MOVE_FRAC  = 0.18     # must have been moving at this frac/sec
+    # Freeze
+    FREEZE_MOVE_FRAC  = 0.18
     FREEZE_HOLD_SECS  = 4.0
 
-    # ── Prolonged presence ────────────────────────────────────
-    PRESENCE_SECS     = 180      # 3 minutes
+    # Prolonged presence
+    PRESENCE_SECS     = 180
 
-    # ── Crouching ─────────────────────────────────────────────
-    # Uses personal baseline ratio — adapts to camera angle automatically.
-    # Webcam close-up: baseline ~0.7, threshold = 0.7 * 0.65 = 0.455
-    # Camera from above: baseline ~0.5, threshold = 0.5 * 0.65 = 0.325
-    CROUCH_DROP_FACTOR    = 0.65  # ratio must drop to 65% of personal baseline
+    # Crouching (personal baseline — adapts to camera angle)
+    CROUCH_DROP_FACTOR    = 0.65
     CROUCH_FRAMES_MIN     = 8
-    CROUCH_MAX_FRAME_FILL = 0.45  # bbox height must be < 45% of frame (not close-up)
+    CROUCH_MAX_FRAME_FILL = 0.45
 
-    # ── Tailgating ────────────────────────────────────────────
-    # Dynamic threshold = 12% of frame width (scales with any resolution)
-    # Also checks direction: both persons must be moving same way
+    # Tailgating (dynamic threshold + direction check)
     TAILGATE_FRAME_FRAC = 0.12
-    TAILGATE_DIR_THRESH = 60     # degrees — directions must match within 60°
+    TAILGATE_DIR_THRESH = 60
 
-    # ── Zone approach ─────────────────────────────────────────
+    # Zone approach
     ZONE_APPROACH_MIN = 4
 
     def __init__(self, pid):
@@ -91,8 +83,7 @@ class PersonBehaviourTracker:
         self.bboxes           = deque(maxlen=30)
         self.anomalies        = []
 
-        # Threat decay — score accumulates but decays 5% per frame
-        # Prevents score staying high after behaviour stops
+        # Time-based threat decay (FPS independent)
         self.threat_score     = 0.0
         self._last_decay_time = time.time()
 
@@ -119,13 +110,6 @@ class PersonBehaviourTracker:
 
     def update(self, bbox, frame_shape=None, near_zone=False,
                other_persons=None, fps=30):
-        """
-        bbox         : [x1, y1, x2, y2]
-        frame_shape  : frame.shape — (h, w, c)
-        near_zone    : bool from zone_manager.is_near()
-        other_persons: list of other bboxes [[x1,y1,x2,y2], ...]
-        fps          : actual measured FPS from detection loop
-        """
         x1, y1, x2, y2 = bbox
         cx  = (x1 + x2) / 2.0
         cy  = (y1 + y2) / 2.0
@@ -149,13 +133,9 @@ class PersonBehaviourTracker:
         self.bboxes.append((bh, bw, now))
 
         # Time-based decay (FPS independent)
-        now_decay   = time.time()
-        delta_time  = now_decay - self._last_decay_time
-        self._last_decay_time = now_decay
-
-        decay_rate = 0.7   # Tune this value (0.5 slower, 1.0 faster)
-
-        self.threat_score *= math.exp(-decay_rate * delta_time)
+        delta_time            = now - self._last_decay_time
+        self._last_decay_time = now
+        self.threat_score    *= math.exp(-0.7 * delta_time)
 
         self.anomalies = []
 
@@ -176,14 +156,12 @@ class PersonBehaviourTracker:
         dt         = max(now - pt, 0.001)
         dist       = math.sqrt(dx*dx + dy*dy)
 
-        # ── JITTER FILTER ──────────────────────────────────────
-        # If movement < MIN_DISPLACEMENT → treat as stationary.
-        # This kills false pacing/erratic/circling from bbox noise.
-        if dist < self.MIN_DISPLACEMENT:
+        # JITTER FILTER — fraction-based, scales with any resolution
+        min_disp = self._frame_w * self.MIN_DISPLACEMENT_FRAC
+        if dist < min_disp:
             self.norm_speeds.append(0.0)
             # No direction update — stationary = no real direction
         else:
-            # Normalize by frame diagonal → camera independent
             px_per_sec = dist / dt
             self.norm_speeds.append(px_per_sec / self._frame_diag)
             self.directions.append(math.degrees(math.atan2(dy, dx)))
@@ -203,7 +181,7 @@ class PersonBehaviourTracker:
         if other_persons:
             self._check_tailgate(cx, cy, other_persons)
 
-    # ── Checks ──────────────────────────────────────────────────
+    # ── Behaviour checks ────────────────────────────────────────
 
     def _check_running(self):
         if len(self.norm_speeds) < 8:
@@ -217,7 +195,7 @@ class PersonBehaviourTracker:
     def _check_pacing(self):
         if len(self.directions) < 20:
             return
-        window    = list(self.directions)[-self.PACE_WINDOW:]  # computed ONCE
+        window    = list(self.directions)[-self.PACE_WINDOW:]
         reversals = 0
         for i in range(1, len(window)):
             diff = abs(window[i] - window[i-1])
@@ -228,7 +206,6 @@ class PersonBehaviourTracker:
             self._add("PACING", min(10 + reversals * 2, 25))
 
     def _check_erratic(self):
-        """Uses circular std — mathematically correct for angles."""
         if len(self.directions) < self.ERRATIC_WINDOW:
             return
         circ_std = _circular_std(list(self.directions)[-self.ERRATIC_WINDOW:])
@@ -237,11 +214,6 @@ class PersonBehaviourTracker:
                       min(int((circ_std - self.ERRATIC_CIRC_STD) / 0.5 * 8) + 10, 20))
 
     def _check_circling(self):
-        """
-        Two complementary checks:
-        A) Anchor — returns to fixed first-ever position (true origin return)
-        B) Rolling — returns to window start (ongoing looping behaviour)
-        """
         if len(self.positions) < 50:
             return
         total_path = sum(
@@ -253,22 +225,16 @@ class PersonBehaviourTracker:
             return
         cx_now, cy_now, _ = self.positions[-1]
 
-        # A) Anchor check
         ax, ay = self._circle_anchor
         if math.sqrt((cx_now-ax)**2 + (cy_now-ay)**2) <= self.CIRCLE_ANCHOR_RETURN:
             self._add("CIRCLING AREA (origin return)", 25)
             return
 
-        # B) Rolling window check
         ox, oy, _ = self.positions[0]
         if math.sqrt((cx_now-ox)**2 + (cy_now-oy)**2) <= self.CIRCLE_ROLLING_RETURN:
             self._add("CIRCLING AREA (looping)", 20)
 
     def _check_crouching(self):
-        """
-        Personal baseline approach — adapts to any camera angle.
-        Flags only when ratio drops significantly below THIS person's normal.
-        """
         if self._baseline_ratio is None or len(self.bboxes) < 10:
             return
         threshold     = self._baseline_ratio * self.CROUCH_DROP_FACTOR
@@ -283,8 +249,8 @@ class PersonBehaviourTracker:
     def _check_freeze(self, now):
         if len(self.norm_speeds) < 12:
             return
-        prev_avg   = sum(list(self.norm_speeds)[-12:-4]) / 8
-        curr_abs   = list(self.norm_speeds)[-1] * self._frame_diag
+        prev_avg = sum(list(self.norm_speeds)[-12:-4]) / 8
+        curr_abs = list(self.norm_speeds)[-1] * self._frame_diag
 
         if prev_avg >= self.FREEZE_MOVE_FRAC:
             self.was_fast_before = True
@@ -319,10 +285,6 @@ class PersonBehaviourTracker:
             self._add("CARRYING: " + self.carrying_label, 25)
 
     def _check_tailgate(self, cx, cy, other_persons):
-        """
-        Dynamic threshold (scales with frame width) + direction check.
-        Filters false positives: two people talking vs two people moving together.
-        """
         threshold = self._frame_w * self.TAILGATE_FRAME_FRAC
         my_dir    = list(self.directions)[-1] if self.directions else None
         for ob in other_persons:
@@ -345,6 +307,8 @@ class PersonBehaviourTracker:
             self.anomalies.append((name, score))
             self.threat_score += score
 
+    # ── Public getters ───────────────────────────────────────────
+
     def get_anomaly_score(self):
         return min(self.threat_score, 60)
 
@@ -356,3 +320,31 @@ class PersonBehaviourTracker:
 
     def get_fps(self):
         return self._fps
+
+    def get_current_speed_pxsec(self):
+        """
+        Current speed in pixels/sec.
+        Used by threat_engine for ML feature: 'speed'.
+        Returns 0.0 if no movement recorded yet.
+        """
+        if not self.norm_speeds:
+            return 0.0
+        return self.norm_speeds[-1] * self._frame_diag
+
+    def get_freeze_duration(self):
+        """
+        How long this person has been frozen in seconds.
+        Used by threat_engine for ML feature: 'freeze_time'.
+        Returns 0.0 if not currently frozen.
+        """
+        if self.still_since is not None:
+            return time.time() - self.still_since
+        return 0.0
+
+    def get_anomalies_with_scores(self):
+        """
+        Returns copy of active anomalies as [(name, score), ...].
+        Used by app.py LLM queue to build factor list for LM Studio prompt.
+        Same data as bt.anomalies but accessed via explicit method.
+        """
+        return list(self.anomalies)

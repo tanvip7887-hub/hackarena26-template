@@ -1,11 +1,10 @@
-# Core dependencies
-ultralytics==8.1.2        # YOLOv8
-opencv-python==4.7.0.72    # OpenCV for video capture and processing
-numpy==1.25.0              # Numpy for array operations
-filterpy==1.4.5            # Kalman Filter for SORT tracker
-scipy==1.11.1              # Required by filterpy
-lap==0.4.0                 # Linear assignment for SORT tracker
-
-# Optional / utilities
-pillow==10.0.0             # Image processing if needed
-tqdm==4.66.1               # Progress bars for video processing
+ultralytics==8.2.0
+opencv-python==4.9.0.80
+numpy==1.26.4
+flask==3.0.3
+flask-cors==4.0.1
+filterpy==1.4.5
+scipy==1.13.0
+scikit-learn==1.5.0
+pandas==2.2.2
+joblib==1.4.2
