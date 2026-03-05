@@ -1,6 +1,8 @@
 import time
 
+
 LOITER_THRESHOLD_SECONDS = 30
+
 
 class LoiterTracker:
     def __init__(self, threshold=LOITER_THRESHOLD_SECONDS):
