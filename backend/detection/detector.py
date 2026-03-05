@@ -1,64 +1,59 @@
-import argparse
-import cv2
-from ultralytics import YOLO
-from detection.tracker import Tracker  # import the basic tracker
+"""
+detector.py — YOLOv8 person detection wrapper.
+Uses the lightweight yolov8n.pt model (auto-downloaded on first run).
+Only detects class 0 = 'person' to keep it fast on CPU.
+"""
+
 import numpy as np
+from ultralytics import YOLO
 
-# Load YOLOv8 model
-model = YOLO("yolov8n.pt")  
 
-# Parse arguments
-parser = argparse.ArgumentParser(description="Person Detection Mode")
-parser.add_argument(
-    "--mode", choices=["webcam", "video"], default="webcam",
-    help="Choose 'webcam' for live camera or 'video' for demo video"
-)
-parser.add_argument(
-    "--video_path", type=str, default="videos/sample.mp4",
-    help="Path to demo video (used only if mode=video)"
-)
-args = parser.parse_args()
+class PersonDetector:
+    """
+    Wraps YOLOv8n for person-only detection.
+    Returns bounding boxes as [[x1, y1, x2, y2], ...].
+    """
 
-# Video capture
-if args.mode == "webcam":
-    cap = cv2.VideoCapture(0) 
-else:
-    cap = cv2.VideoCapture(args.video_path)  
+    # COCO class index for 'person'
+    PERSON_CLASS_ID = 0
 
-print(f"[INFO] Running in {args.mode} mode")
+    def __init__(self, model_path: str = "yolov8n.pt", confidence: float = 0.4):
+        """
+        Args:
+            model_path: Path or name of the YOLOv8 model weights.
+                        'yolov8n.pt' will be downloaded automatically.
+            confidence: Minimum detection confidence (0–1).
+        """
+        print(f"[Detector] Loading YOLOv8 model: {model_path}")
+        self.model = YOLO(model_path)
+        self.confidence = confidence
+        print("[Detector] Model ready.")
 
-# Initialize tracker
-tracker = Tracker(iou_threshold=0.3)
+    def detect(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Run inference on a single BGR frame.
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+        Args:
+            frame: OpenCV BGR image (H x W x 3).
 
-    # Run YOLO detection
-    results = model(frame)[0]
+        Returns:
+            np.ndarray of shape (N, 4): [[x1, y1, x2, y2], ...]
+            Returns empty array if no persons detected.
+        """
+        # Run inference — verbose=False suppresses per-frame logs
+        results = self.model(
+            frame,
+            classes=[self.PERSON_CLASS_ID],
+            conf=self.confidence,
+            verbose=False,
+        )
 
-    # Collect person boxes
-    boxes = []
-    for box, score, cls in zip(results.boxes.xyxy, results.boxes.conf, results.boxes.cls):
-        if int(cls) == 0:
-            x1, y1, x2, y2 = map(int, box)
-            boxes.append([x1, y1, x2, y2])
+        boxes = []
+        for result in results:
+            for box in result.boxes:
+                cls = int(box.cls[0])
+                if cls == self.PERSON_CLASS_ID:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    boxes.append([x1, y1, x2, y2])
 
-    # Update tracker and get tracked boxes with IDs
-    tracks = tracker.update(boxes)
-
-    # Draw tracked boxes
-    for x1, y1, x2, y2, track_id in tracks:
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)  # red boxes for tracked IDs
-        cv2.putText(frame, f"ID {track_id}", (x1, y1-5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
-    # Show frame
-    cv2.imshow("Person Detection + Tracking", frame)
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
-
-# Release resources
-cap.release()
-cv2.destroyAllWindows()
+        return np.array(boxes, dtype=float) if boxes else np.empty((0, 4))

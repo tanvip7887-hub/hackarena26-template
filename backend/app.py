@@ -1,4 +1,5 @@
 # app.py
+
 import argparse
 import cv2
 from detection.detector import PersonDetector
